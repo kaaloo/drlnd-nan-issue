@@ -19,7 +19,7 @@ TAU = 1e-3              # for soft update of target parameters
 LR = 5e-4               # learning rate
 UPDATE_EVERY = 4        # how often to update the network
 PRIORITY_EPSILON = 1e-6  # Don't allow zero probabilities in replay buffer
-GRAD_CLIP = 100.0       # Clip gradients to this value
+GRAD_CLIP = 0.1         # Clip gradients to this value
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Torch device: {}".format(device))
@@ -55,6 +55,11 @@ class Agent():
         self.t_step = 0
         # BETA hyperparameter needs to be annealed over time to reach 1.0
         self.beta = BETA
+
+    def init_episode(self, max_t):
+        self.beta = BETA
+        self.t_step = 0
+        self.max_t = max_t
 
     def step(self, state, action, reward, next_state, done):
         # Save experience in replay memory
@@ -103,10 +108,12 @@ class Agent():
         sampling_weights = len(self.memory) * probs
         sampling_weights = np.power(sampling_weights, -self.beta)
         sampling_weights = sampling_weights / sampling_weights.max()
+        nan_count = np.count_nonzero(np.isnan(sampling_weights))
         sampling_weights = torch.from_numpy(sampling_weights).to(device)
 
-        self.beta = self.beta + BETA_ANNEALING * self.beta
-        self.beat = min(self.beta, 1.0)
+        # PER: increase beta (see PER in https://github.com/Curt-Park/rainbow-is-all-you-need)
+        fraction = min(self.t_step / self.max_t, 1.0)
+        self.beta = self.beta + fraction * (1.0 - self.beta)
 
         # Use Double DQN
         # Get max predicted Q values (for next states) from target model
@@ -116,8 +123,7 @@ class Agent():
             next_states).gather(1, local_actions).detach()
 
         # Compute Q targets for current states
-        Q_targets = torch.clamp(rewards, min=-1.0, max=1.0) + \
-            (gamma * Q_targets_next * (1 - dones))
+        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
 
         # Get expected Q values from local model
         Q_expected = self.qnetwork_local(states).gather(1, actions)
@@ -128,12 +134,16 @@ class Agent():
 
         self.optimizer.zero_grad()
         loss.backward()
-        # torch.nn.utils.clip_grad_value_(
+        # torch.nn.utils.clip_grad_norm_(
         #     self.qnetwork_local.parameters(), GRAD_CLIP)
         self.optimizer.step()
 
         # Update priorities
+        # elementwise_loss = elementwise_loss.clamp(min=1e-3)
         priorities = elementwise_loss.detach().cpu().squeeze().numpy()
+        # nan_count = np.count_nonzero(np.isnan(priorities))
+        # if nan_count > 0:
+        #     print('Nan priorities: {}.  Skipping update'.format(nan_count))
         self.memory.update(indices, priorities)
 
         # ------------------- update target network ------------------- #
@@ -180,7 +190,7 @@ class PriorityReplayBuffer:
         self.max_p = 1.0  # Initialize maximum priority
         self.batch_size = batch_size
         self.experience = namedtuple("Experience", field_names=[
-                                     "state", "action", "reward", "next_state", "done"])
+            "state", "action", "reward", "next_state", "done"])
         random.seed(seed)
 
     def add(self, state, action, reward, next_state, done):
@@ -198,6 +208,7 @@ class PriorityReplayBuffer:
         self.ptr = self.ptr % self.buffer_size
 
     def update(self, indices, priorities):
+        assert not np.isnan(priorities).any()
         self.priorities[indices] = np.power(priorities, ALPHA)
         self.max_p = np.max(priorities)
 
@@ -209,7 +220,7 @@ class PriorityReplayBuffer:
         probs = probs / probs.sum()
 
         indices = np.random.choice(
-            len(self), size=self.batch_size, p=probs)
+            len(self), size=self.batch_size, p=probs, replace=False)
 
         actions = torch.from_numpy(
             self.actions[indices]).long().unsqueeze(1).to(device)
